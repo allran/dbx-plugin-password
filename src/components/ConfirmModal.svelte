@@ -102,7 +102,7 @@
     cursor: pointer;
   }
 
-  .btn:hover:not(:disabled) {
+  .btn:hover:not(:disabled):not(.danger) {
     background: var(--hover);
   }
 
@@ -114,6 +114,11 @@
   .btn.danger {
     background: var(--danger);
     border-color: var(--danger);
-    color: #fff;
+    color: var(--danger-fg, var(--color-destructive-foreground, #fff));
+  }
+
+  .btn.danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 88%, var(--fg));
+    border-color: color-mix(in srgb, var(--danger) 88%, var(--fg));
   }
 </style>

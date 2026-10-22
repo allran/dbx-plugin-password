@@ -8,6 +8,7 @@
    *  text: Record<string, any>,
    *  locale: string,
    *  saving?: boolean,
+   *  editRequestToken?: number,
    *  onsave: (draft: any) => void,
    *  ondelete: () => void,
    *  oncopied: () => void,
@@ -19,6 +20,7 @@
     text,
     locale = "en",
     saving = false,
+    editRequestToken = 0,
     onsave,
     ondelete,
     oncopied,
@@ -39,6 +41,7 @@
   let showPassword = $state(false);
   let editing = $state(false);
   let entryId = $state("");
+  let lastEditRequestToken = $state(0);
 
   function syncFromEntry(source) {
     draft = {
@@ -72,6 +75,14 @@
     }
   });
 
+  $effect(() => {
+    if (!editRequestToken || editRequestToken === lastEditRequestToken || !entry) {
+      return;
+    }
+    lastEditRequestToken = editRequestToken;
+    startEdit();
+  });
+
   async function copyField(value) {
     if (await copyText(value)) oncopied?.();
   }
@@ -85,7 +96,6 @@
   function startEdit() {
     if (!entry) return;
     syncFromEntry(entry);
-    showPassword = true;
     editing = true;
   }
 
@@ -172,7 +182,12 @@
         <span class="label">{text.title}</span>
         <div class="control">
           {#if editing}
-            <input type="text" bind:value={draft.title} disabled={saving} />
+            <input
+              type="text"
+              bind:value={draft.title}
+              placeholder={text.titlePlaceholder}
+              disabled={saving}
+            />
           {:else}
             <div class="value">{displayValue(draft.title)}</div>
           {/if}
@@ -201,6 +216,7 @@
             <input
               type="text"
               bind:value={draft.username}
+              placeholder={text.usernamePlaceholder}
               disabled={saving}
               autocomplete="off"
             />
@@ -226,6 +242,7 @@
             <input
               type={showPassword ? "text" : "password"}
               bind:value={draft.password}
+              placeholder={text.passwordPlaceholder}
               disabled={saving}
               autocomplete="new-password"
             />
@@ -243,7 +260,7 @@
               disabled={saving}
               onclick={generatePassword}
             >
-              <Icon name="refresh" />
+              <Icon name="dice" />
             </button>
           {/if}
           <button
@@ -271,7 +288,12 @@
         <span class="label">{text.url}</span>
         <div class="control with-action">
           {#if editing}
-            <input type="url" bind:value={draft.url} disabled={saving} />
+            <input
+              type="url"
+              bind:value={draft.url}
+              placeholder={text.urlPlaceholder}
+              disabled={saving}
+            />
           {:else}
             <div class="value">{displayValue(draft.url)}</div>
           {/if}
@@ -291,7 +313,12 @@
         <span class="label">{text.notes}</span>
         <div class="control">
           {#if editing}
-            <textarea rows="5" bind:value={draft.notes} disabled={saving}></textarea>
+            <textarea
+              rows="5"
+              bind:value={draft.notes}
+              placeholder={text.notesPlaceholder}
+              disabled={saving}
+            ></textarea>
           {:else}
             <div class="value multiline">{displayValue(draft.notes)}</div>
           {/if}

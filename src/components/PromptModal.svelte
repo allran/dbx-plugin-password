@@ -149,7 +149,7 @@
     cursor: pointer;
   }
 
-  .btn:hover:not(:disabled) {
+  .btn:hover:not(:disabled):not(.primary) {
     background: var(--hover);
   }
 
@@ -161,10 +161,11 @@
   .btn.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    color: var(--accent-fg, var(--color-primary-foreground, #fff));
   }
 
   .btn.primary:hover:not(:disabled) {
-    filter: brightness(1.05);
+    background: color-mix(in srgb, var(--accent) 88%, var(--fg));
+    border-color: color-mix(in srgb, var(--accent) 88%, var(--fg));
   }
 </style>

@@ -107,8 +107,9 @@ impl PluginHandler for Plugin {
             }
             "group/create" => {
                 let name = require_str(&params, "name")?;
+                let parent_id = optional_str(&params, "parentId");
                 self.with_store(|store| {
-                    let group = store.create_group(name)?;
+                    let group = store.create_group(name, parent_id)?;
                     Ok(json!({ "group": group }))
                 })
             }

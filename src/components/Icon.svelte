@@ -20,6 +20,9 @@
     <path d="M12 15h9" />
     <path d="M18 12v6" />
     <path d="M21 12v6" />
+  {:else if name === "lock"}
+    <rect x="5" y="11" width="14" height="10" rx="2" />
+    <path d="M8 11V8a4 4 0 0 1 8 0v3" />
   {:else if name === "folder-plus"}
     <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
     <path d="M12 11v6" />
@@ -41,9 +44,13 @@
   {:else if name === "edit"}
     <path d="M12 20h9" />
     <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4 11.5-11.5z" />
-  {:else if name === "refresh"}
-    <path d="M21 12a9 9 0 1 1-2.6-6.4" />
-    <path d="M21 4v6h-6" />
+  {:else if name === "dice"}
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <circle cx="8" cy="8" r="1.25" fill="currentColor" stroke="none" />
+    <circle cx="16" cy="8" r="1.25" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.25" fill="currentColor" stroke="none" />
+    <circle cx="8" cy="16" r="1.25" fill="currentColor" stroke="none" />
+    <circle cx="16" cy="16" r="1.25" fill="currentColor" stroke="none" />
   {:else if name === "save"}
     <path d="M5 3h11l3 3v15a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
     <path d="M8 3v6h8V3" />

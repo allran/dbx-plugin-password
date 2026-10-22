@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -19,6 +20,7 @@ impl VaultStore {
             .and_then(|raw| serde_json::from_str::<VaultData>(&raw).ok())
             .unwrap_or_default();
         data.ensure_default_group(now_ms());
+        Self::sanitize_parents(&mut data);
         for entry in &mut data.entries {
             if entry.group_id.is_empty()
                 || !data.groups.iter().any(|g| g.id == entry.group_id)
@@ -27,6 +29,52 @@ impl VaultStore {
             }
         }
         Self { data, path }
+    }
+
+    fn sanitize_parents(data: &mut VaultData) {
+        let ids: HashSet<String> = data.groups.iter().map(|g| g.id.clone()).collect();
+        for group in &mut data.groups {
+            if group.id == DEFAULT_GROUP_ID {
+                group.parent_id.clear();
+                continue;
+            }
+            let parent = group.parent_id.trim();
+            if parent.is_empty() || parent == group.id || !ids.contains(parent) {
+                group.parent_id.clear();
+            } else {
+                group.parent_id = parent.to_string();
+            }
+        }
+        // Break cycles by walking ancestors; on cycle clear parent.
+        let snapshot: Vec<(String, String)> = data
+            .groups
+            .iter()
+            .map(|g| (g.id.clone(), g.parent_id.clone()))
+            .collect();
+        let parent_of: std::collections::HashMap<&str, &str> = snapshot
+            .iter()
+            .map(|(id, parent)| (id.as_str(), parent.as_str()))
+            .collect();
+        let mut cyclic: HashSet<String> = HashSet::new();
+        for (id, _) in &snapshot {
+            let mut seen = HashSet::new();
+            let mut cur = id.as_str();
+            loop {
+                if !seen.insert(cur) {
+                    cyclic.insert(id.clone());
+                    break;
+                }
+                let Some(parent) = parent_of.get(cur).copied().filter(|p| !p.is_empty()) else {
+                    break;
+                };
+                cur = parent;
+            }
+        }
+        for group in &mut data.groups {
+            if cyclic.contains(&group.id) {
+                group.parent_id.clear();
+            }
+        }
     }
 
     fn persist(&self) -> Result<(), PluginError> {
@@ -85,23 +133,50 @@ impl VaultStore {
         self.data.groups.iter().any(|g| g.id == id)
     }
 
-    pub fn create_group(&mut self, name: &str) -> Result<Group, PluginError> {
+    fn resolve_parent_id(&self, parent_id: Option<&str>) -> Result<String, PluginError> {
+        let parent_id = parent_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("");
+        if parent_id.is_empty() {
+            return Ok(String::new());
+        }
+        if !self.group_exists(parent_id) {
+            return Err(PluginError::new(-32602, "Parent group not found"));
+        }
+        Ok(parent_id.to_string())
+    }
+
+    fn sibling_name_taken(&self, parent_id: &str, name: &str, except_id: Option<&str>) -> bool {
+        self.data.groups.iter().any(|g| {
+            if g.parent_id != parent_id || !g.name.eq_ignore_ascii_case(name) {
+                return false;
+            }
+            match except_id {
+                Some(id) => g.id != id,
+                None => true,
+            }
+        })
+    }
+
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Group, PluginError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(PluginError::new(-32602, "Group name is required"));
         }
-        if self
-            .data
-            .groups
-            .iter()
-            .any(|g| g.name.eq_ignore_ascii_case(name))
-        {
+        let parent_id = self.resolve_parent_id(parent_id)?;
+        if self.sibling_name_taken(&parent_id, name, None) {
             return Err(PluginError::new(-32602, "Group name already exists"));
         }
         let now = now_ms();
         let group = Group {
             id: Uuid::new_v4().to_string(),
             name: name.to_string(),
+            parent_id,
             created_at: now,
             updated_at: now,
         };
@@ -118,12 +193,14 @@ impl VaultStore {
         if name.is_empty() {
             return Err(PluginError::new(-32602, "Group name is required"));
         }
-        if self
+        let parent_id = self
             .data
             .groups
             .iter()
-            .any(|g| g.id != id && g.name.eq_ignore_ascii_case(name))
-        {
+            .find(|g| g.id == id)
+            .map(|g| g.parent_id.clone())
+            .ok_or_else(|| PluginError::new(-32602, "Group not found"))?;
+        if self.sibling_name_taken(&parent_id, name, Some(id)) {
             return Err(PluginError::new(-32602, "Group name already exists"));
         }
         let now = now_ms();
@@ -147,16 +224,34 @@ impl VaultStore {
         if id == DEFAULT_GROUP_ID {
             return Err(PluginError::new(-32602, "Cannot delete the default group"));
         }
-        if !self.group_exists(id) {
-            return Err(PluginError::new(-32602, "Group not found"));
-        }
-        self.data.groups.retain(|g| g.id != id);
-        for entry in &mut self.data.entries {
-            if entry.group_id == id {
-                entry.group_id = DEFAULT_GROUP_ID.to_string();
-                entry.updated_at = now_ms();
+        let parent_id = self
+            .data
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.parent_id.clone())
+            .ok_or_else(|| PluginError::new(-32602, "Group not found"))?;
+
+        let fallback = if parent_id.is_empty() || !self.group_exists(&parent_id) {
+            DEFAULT_GROUP_ID.to_string()
+        } else {
+            parent_id.clone()
+        };
+
+        let now = now_ms();
+        for group in &mut self.data.groups {
+            if group.parent_id == id {
+                group.parent_id = parent_id.clone();
+                group.updated_at = now;
             }
         }
+        for entry in &mut self.data.entries {
+            if entry.group_id == id {
+                entry.group_id = fallback.clone();
+                entry.updated_at = now;
+            }
+        }
+        self.data.groups.retain(|g| g.id != id);
         self.persist()?;
         Ok(())
     }

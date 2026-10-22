@@ -2,15 +2,13 @@
   import { onDestroy, onMount } from "svelte";
   import ConfirmModal from "./components/ConfirmModal.svelte";
   import ContextMenu from "./components/ContextMenu.svelte";
+  import GroupNode from "./components/GroupNode.svelte";
   import Icon from "./components/Icon.svelte";
   import PasswordDetail from "./components/PasswordDetail.svelte";
   import PromptModal from "./components/PromptModal.svelte";
   import Toast from "./components/Toast.svelte";
-  import {
-    DEFAULT_GROUP_ID,
-    displayGroupName,
-    resolveMessages,
-  } from "./lib/i18n.js";
+  import { DEFAULT_GROUP_ID, resolveMessages } from "./lib/i18n.js";
+  import { buildGroupTree, flattenGroupOptions } from "./lib/tree.js";
 
   let text = $state(resolveMessages("zh"));
   let locale = $state("zh-CN");
@@ -27,36 +25,30 @@
   let toastVisible = $state(false);
   let toastTimer = 0;
 
-  /** @type {null | { kind: "create-group" | "rename-group", groupId?: string, value?: string }} */
+  /** @type {null | { kind: "create-group" | "create-password" | "rename-group", groupId?: string, parentId?: string, value?: string }} */
   let prompt = $state(null);
   /** @type {null | { kind: "delete-group" | "delete-entry", id: string }} */
   let confirm = $state(null);
-  /** @type {null | { x: number, y: number, groupId: string }} */
+  /** @type {null | { kind: "group" | "entry", x: number, y: number, groupId?: string, entryId?: string }} */
   let menu = $state(null);
+  /** Bumped to ask PasswordDetail to enter edit mode for the selected entry */
+  let editRequestToken = $state(0);
 
   /** Target group when creating a password from context menu / toolbar */
   let createGroupId = $state(DEFAULT_GROUP_ID);
+  /** Parent when creating a nested group; empty = root */
+  let createParentId = $state("");
 
   const selected = $derived(entries.find((e) => e.id === selectedId) || null);
 
-  const groupOptions = $derived(
-    groups.map((g) => ({
-      id: g.id,
-      label: displayGroupName(g, text),
-    })),
-  );
+  const groupOptions = $derived(flattenGroupOptions(groups, locale, text));
 
   const needle = $derived(query.trim().toLowerCase());
 
   const filteredEntries = $derived(
     needle
       ? entries.filter((entry) => {
-          const hay = [
-            entry.title,
-            entry.username,
-            entry.url,
-            entry.notes,
-          ]
+          const hay = [entry.title, entry.username, entry.url, entry.notes]
             .join("\n")
             .toLowerCase();
           return hay.includes(needle);
@@ -64,27 +56,12 @@
       : entries,
   );
 
-  const sections = $derived(
-    groups.map((group) => {
-      const items = filteredEntries
-        .filter((entry) => entry.groupId === group.id)
-        .slice()
-        .sort((a, b) => String(a.title).localeCompare(String(b.title), locale));
-      return {
-        group,
-        label: displayGroupName(group, text),
-        items,
-        collapsed: Boolean(collapsed[group.id]),
-      };
-    }),
+  const tree = $derived(
+    buildGroupTree(groups, filteredEntries, collapsed, needle, locale, text),
   );
 
-  const visibleSections = $derived(
-    needle ? sections.filter((section) => section.items.length > 0) : sections,
-  );
-
-  const hasAny = $derived(entries.length > 0);
-  const hasVisible = $derived(visibleSections.some((s) => s.items.length > 0));
+  const hasTree = $derived(groups.length > 0);
+  const hasVisible = $derived(tree.length > 0);
 
   function applyLocale() {
     locale = window.dbxPlugin?.locale || navigator.language || "zh-CN";
@@ -101,7 +78,18 @@
   }
 
   function errorMessage(err) {
-    return err?.message || err?.error?.message || String(err || text.error);
+    const raw = err?.message || err?.error?.message || String(err || text.error);
+    const mapped = {
+      "Group name is required": text.requiredGroupName,
+      "Group name already exists": text.groupNameExists,
+      "Group not found": text.groupNotFound,
+      "Parent group not found": text.parentGroupNotFound,
+      "Cannot rename the default group": text.cannotRenameDefault,
+      "Cannot delete the default group": text.cannotDeleteDefault,
+      "Title is required": text.requiredTitle,
+      "Password entry not found": text.entryNotFound,
+    };
+    return mapped[raw] || raw;
   }
 
   async function loadList(keepSelection = true) {
@@ -136,8 +124,9 @@
     };
   }
 
-  function openCreateGroup() {
-    prompt = { kind: "create-group", value: "" };
+  function openCreateGroup(parentId = "") {
+    createParentId = parentId || "";
+    prompt = { kind: "create-group", parentId: createParentId, value: "" };
   }
 
   function openRenameGroup(groupId) {
@@ -169,10 +158,28 @@
     event.preventDefault();
     event.stopPropagation();
     menu = {
+      kind: "group",
       x: Math.min(event.clientX, window.innerWidth - 180),
-      y: Math.min(event.clientY, window.innerHeight - 140),
+      y: Math.min(event.clientY, window.innerHeight - 180),
       groupId,
     };
+  }
+
+  function openEntryMenu(event, entryId) {
+    event.preventDefault();
+    event.stopPropagation();
+    selectedId = entryId;
+    menu = {
+      kind: "entry",
+      x: Math.min(event.clientX, window.innerWidth - 180),
+      y: Math.min(event.clientY, window.innerHeight - 120),
+      entryId,
+    };
+  }
+
+  function requestEditEntry(entryId) {
+    selectedId = entryId;
+    editRequestToken += 1;
   }
 
   async function handlePromptConfirm(value) {
@@ -186,8 +193,15 @@
           showToast(text.requiredGroupName);
           return;
         }
-        await window.dbxPlugin.invoke("group/create", { name });
+        const parentId = prompt.parentId || createParentId || "";
+        await window.dbxPlugin.invoke("group/create", {
+          name,
+          parentId: parentId || undefined,
+        });
         await loadList();
+        if (parentId) {
+          collapsed = { ...collapsed, [parentId]: false };
+        }
         showToast(text.groupCreated);
       } else if (kind === "rename-group") {
         if (!name) {
@@ -214,8 +228,10 @@
           notes: "",
         });
         await loadList();
-        selectedId = result?.entry?.id || "";
+        const newId = result?.entry?.id || "";
+        selectedId = newId;
         collapsed = { ...collapsed, [createGroupId]: false };
+        if (newId) editRequestToken += 1;
         showToast(text.created);
       }
       prompt = null;
@@ -278,31 +294,45 @@
   }
 
   function onMenuSelect(actionId) {
-    const groupId = menu?.groupId;
+    const current = menu;
     menu = null;
+    if (!current) return;
+    if (current.kind === "entry") {
+      if (actionId === "edit") requestEditEntry(current.entryId);
+      if (actionId === "delete") openDeleteEntry(current.entryId);
+      return;
+    }
+    const groupId = current.groupId;
     if (!groupId) return;
+    if (actionId === "new-group") openCreateGroup(groupId);
     if (actionId === "new-password") openCreatePassword(groupId);
     if (actionId === "rename") openRenameGroup(groupId);
     if (actionId === "delete") openDeleteGroup(groupId);
   }
 
   const menuItems = $derived(
-    menu
-      ? [
-          { id: "new-password", label: text.newPassword },
-          {
-            id: "rename",
-            label: text.rename,
-            disabled: menu.groupId === DEFAULT_GROUP_ID,
-          },
-          {
-            id: "delete",
-            label: text.deleteGroup,
-            danger: true,
-            disabled: menu.groupId === DEFAULT_GROUP_ID,
-          },
-        ]
-      : [],
+    !menu
+      ? []
+      : menu.kind === "entry"
+        ? [
+            { id: "edit", label: text.edit },
+            { id: "delete", label: text.delete, danger: true },
+          ]
+        : [
+            { id: "new-group", label: text.newGroup },
+            { id: "new-password", label: text.newPassword },
+            {
+              id: "rename",
+              label: text.rename,
+              disabled: menu.groupId === DEFAULT_GROUP_ID,
+            },
+            {
+              id: "delete",
+              label: text.deleteGroup,
+              danger: true,
+              disabled: menu.groupId === DEFAULT_GROUP_ID,
+            },
+          ],
   );
 
   const promptTitle = $derived(
@@ -315,6 +345,12 @@
 
   const promptLabel = $derived(
     prompt?.kind === "create-password" ? text.title : text.groupName,
+  );
+
+  const promptPlaceholder = $derived(
+    prompt?.kind === "create-password"
+      ? text.titlePlaceholder
+      : text.groupNamePlaceholder,
   );
 
   onMount(async () => {
@@ -352,7 +388,7 @@
         <Icon name="key" size={15} />
         <span>{text.newPassword}</span>
       </button>
-      <button type="button" class="btn" onclick={openCreateGroup}>
+      <button type="button" class="btn" onclick={() => openCreateGroup("")}>
         <Icon name="folder-plus" size={15} />
         <span>{text.newGroup}</span>
       </button>
@@ -375,49 +411,20 @@
     <div class="tree">
       {#if bootError}
         <div class="empty error">{bootError}</div>
-      {:else if !hasAny}
+      {:else if !hasTree}
         <div class="empty">{text.empty}</div>
-      {:else if !hasVisible}
+      {:else if needle && !hasVisible}
         <div class="empty">{text.emptyFilter}</div>
       {:else}
-        {#each visibleSections as section (section.group.id)}
-          <div class="group" aria-expanded={!section.collapsed}>
-            <div class="group-row">
-              <button
-                type="button"
-                class="chevron"
-                class:collapsed={section.collapsed}
-                aria-label="toggle"
-                onclick={() => toggleGroup(section.group.id)}
-              >
-                ▾
-              </button>
-              <button
-                type="button"
-                class="group-name"
-                onclick={() => toggleGroup(section.group.id)}
-                oncontextmenu={(event) => openGroupMenu(event, section.group.id)}
-              >
-                <span class="group-label">{section.label}</span>
-                <span class="count">{section.items.length}</span>
-              </button>
-            </div>
-
-            {#if !section.collapsed}
-              <div class="entries" role="group">
-                {#each section.items as entry (entry.id)}
-                  <button
-                    type="button"
-                    class="entry"
-                    class:active={selectedId === entry.id}
-                    onclick={() => (selectedId = entry.id)}
-                  >
-                    <span class="entry-title">{entry.title || "—"}</span>
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </div>
+        {#each tree as node (node.group.id)}
+          <GroupNode
+            {node}
+            {selectedId}
+            onToggle={toggleGroup}
+            onGroupMenu={openGroupMenu}
+            onSelectEntry={(id) => (selectedId = id)}
+            onEntryMenu={openEntryMenu}
+          />
         {/each}
       {/if}
     </div>
@@ -430,6 +437,7 @@
       {text}
       {locale}
       {saving}
+      {editRequestToken}
       onsave={saveEntry}
       ondelete={() => selected && openDeleteEntry(selected.id)}
       oncopied={() => showToast(text.copied)}
@@ -454,6 +462,7 @@
   title={promptTitle}
   label={promptLabel}
   value={prompt?.value || ""}
+  placeholder={promptPlaceholder}
   confirmLabel={text.save}
   cancelLabel={text.cancel}
   confirming={busy}
@@ -482,7 +491,9 @@
     --hover: color-mix(in srgb, var(--fg) 6%, transparent);
     --active: color-mix(in srgb, var(--fg) 10%, transparent);
     --accent: var(--color-primary, #0f766e);
-    --danger: #dc2626;
+    --accent-fg: var(--color-primary-foreground, #fff);
+    --danger: var(--color-destructive, #dc2626);
+    --danger-fg: var(--color-destructive-foreground, #fff);
     --radius: var(--radius-md, 10px);
     --font: var(--font-sans, ui-sans-serif, system-ui, -apple-system, sans-serif);
     --sidebar-width: 280px;
@@ -552,18 +563,19 @@
     white-space: nowrap;
   }
 
-  .btn:hover {
+  .btn:hover:not(.primary) {
     background: var(--hover);
   }
 
   .btn.primary {
     background: var(--accent);
     border-color: var(--accent);
-    color: #fff;
+    color: var(--accent-fg);
   }
 
   .btn.primary:hover {
-    filter: brightness(1.05);
+    background: color-mix(in srgb, var(--accent) 88%, var(--fg));
+    border-color: color-mix(in srgb, var(--accent) 88%, var(--fg));
   }
 
   .search-wrap {
@@ -620,100 +632,6 @@
 
   .empty.error {
     color: var(--danger);
-  }
-
-  .group {
-    margin-bottom: 2px;
-  }
-
-  .group-row {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    padding: 0 8px;
-  }
-
-  .chevron,
-  .group-name,
-  .entry {
-    border: 0;
-    background: transparent;
-    color: inherit;
-    font: inherit;
-    cursor: pointer;
-  }
-
-  .chevron {
-    width: 24px;
-    height: 28px;
-    display: grid;
-    place-items: center;
-    border-radius: 6px;
-    color: var(--muted);
-    transition: transform 0.12s ease;
-    flex-shrink: 0;
-  }
-
-  .chevron.collapsed {
-    transform: rotate(-90deg);
-  }
-
-  .chevron:hover,
-  .group-name:hover,
-  .entry:hover {
-    background: var(--hover);
-  }
-
-  .group-name {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    height: 28px;
-    padding: 0 8px;
-    border-radius: 6px;
-    font-weight: 600;
-  }
-
-  .group-label {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .count {
-    color: var(--muted);
-    font-weight: 500;
-    font-size: 11px;
-  }
-
-  .entries {
-    display: flex;
-    flex-direction: column;
-    padding: 2px 8px 6px 28px;
-    gap: 2px;
-  }
-
-  .entry {
-    display: block;
-    width: 100%;
-    padding: 7px 10px;
-    border-radius: 8px;
-    text-align: left;
-  }
-
-  .entry.active {
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
-  }
-
-  .entry-title {
-    display: block;
-    width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .main {

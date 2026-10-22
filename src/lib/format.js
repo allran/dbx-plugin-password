@@ -19,10 +19,15 @@ const UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const DIGITS = "0123456789";
 const SYMBOLS = "!@#$%^&*()-_=+[]{}?,.";
 
+/** Uniform int in [0, max) without modulo bias. */
 function randomInt(max) {
+  if (max <= 0) return 0;
+  const limit = Math.floor(0x100000000 / max) * max;
   const buffer = new Uint32Array(1);
-  crypto.getRandomValues(buffer);
-  return buffer[0] % max;
+  for (;;) {
+    crypto.getRandomValues(buffer);
+    if (buffer[0] < limit) return buffer[0] % max;
+  }
 }
 
 function pick(charset) {

@@ -7,6 +7,9 @@ pub const DEFAULT_GROUP_ID: &str = "default";
 pub struct Group {
     pub id: String,
     pub name: String,
+    /// Empty string = root-level group. Missing in old vaults → default via serde.
+    #[serde(default)]
+    pub parent_id: String,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -34,7 +37,8 @@ pub struct VaultData {
 
 impl VaultData {
     pub fn ensure_default_group(&mut self, now: u64) {
-        if self.groups.iter().any(|g| g.id == DEFAULT_GROUP_ID) {
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == DEFAULT_GROUP_ID) {
+            group.parent_id.clear();
             return;
         }
         self.groups.insert(
@@ -42,6 +46,7 @@ impl VaultData {
             Group {
                 id: DEFAULT_GROUP_ID.to_string(),
                 name: "Default".to_string(),
+                parent_id: String::new(),
                 created_at: now,
                 updated_at: now,
             },
