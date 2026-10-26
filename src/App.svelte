@@ -137,7 +137,7 @@
       "Wrong master password": text.wrongMasterPassword,
       "Master password is required": text.requiredMasterPassword,
       "Current master password is required": text.requiredCurrentMasterPassword,
-      "Master password must be at least 4 characters": text.masterPasswordTooShort,
+      "Master password must be at least 8 characters": text.masterPasswordTooShort,
     };
     return mapped[raw] || raw;
   }

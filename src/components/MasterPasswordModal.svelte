@@ -77,7 +77,7 @@
       localError = text.requiredMasterPassword;
       return;
     }
-    if ([...password.trim()].length < 4) {
+    if ([...password.trim()].length < 8) {
       localError = text.masterPasswordTooShort;
       return;
     }
