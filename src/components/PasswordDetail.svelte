@@ -1,5 +1,10 @@
 <script>
-  import { copyText, formatDateTime, generateRandomPassword } from "../lib/format.js";
+  import {
+    copyText,
+    formatDateTime,
+    generateRandomPassword,
+    passwordStrength,
+  } from "../lib/format.js";
   import Icon from "./Icon.svelte";
 
   /** @type {{
@@ -11,7 +16,7 @@
    *  editRequestToken?: number,
    *  onsave: (draft: any) => void,
    *  ondelete: () => void,
-   *  oncopied: () => void,
+   *  oncopied: (kind?: string, value?: string) => void,
    *  ongenerated?: () => void,
    * }} */
   let {
@@ -83,9 +88,20 @@
     startEdit();
   });
 
-  async function copyField(value) {
-    if (await copyText(value)) oncopied?.();
+  async function copyField(value, kind = "generic") {
+    if (await copyText(value)) oncopied?.(kind, value);
   }
+
+  const strength = $derived(passwordStrength(draft.password));
+  const strengthLabel = $derived(
+    strength === "weak"
+      ? text.passwordStrengthWeak
+      : strength === "fair"
+        ? text.passwordStrengthFair
+        : strength === "strong"
+          ? text.passwordStrengthStrong
+          : "",
+  );
 
   function generatePassword() {
     draft = { ...draft, password: generateRandomPassword(20) };
@@ -228,7 +244,7 @@
             class="icon-btn"
             title={text.copy}
             aria-label={text.copy}
-            onclick={() => copyField(draft.username)}
+            onclick={() => copyField(draft.username, "username")}
           >
             <Icon name="copy" />
           </button>
@@ -237,50 +253,62 @@
 
       <div class="field">
         <span class="label">{text.password}</span>
-        <div class="control with-action">
-          {#if editing}
-            <input
-              type={showPassword ? "text" : "password"}
-              bind:value={draft.password}
-              placeholder={text.passwordPlaceholder}
-              disabled={saving}
-              autocomplete="new-password"
-            />
-          {:else}
-            <div class="value mono">
-              {showPassword ? displayValue(draft.password) : "••••••••"}
-            </div>
-          {/if}
-          {#if editing}
+        <div class="stack">
+          <div class="control with-action">
+            {#if editing}
+              <input
+                type={showPassword ? "text" : "password"}
+                bind:value={draft.password}
+                placeholder={text.passwordPlaceholder}
+                disabled={saving}
+                autocomplete="new-password"
+              />
+            {:else}
+              <div class="value mono">
+                {showPassword ? displayValue(draft.password) : "••••••••"}
+              </div>
+            {/if}
+            {#if editing}
+              <button
+                type="button"
+                class="icon-btn"
+                title={text.generatePassword}
+                aria-label={text.generatePassword}
+                disabled={saving}
+                onclick={generatePassword}
+              >
+                <Icon name="dice" />
+              </button>
+            {/if}
             <button
               type="button"
               class="icon-btn"
-              title={text.generatePassword}
-              aria-label={text.generatePassword}
-              disabled={saving}
-              onclick={generatePassword}
+              title={showPassword ? text.hide : text.show}
+              aria-label={showPassword ? text.hide : text.show}
+              onclick={() => (showPassword = !showPassword)}
             >
-              <Icon name="dice" />
+              <Icon name={showPassword ? "eye-off" : "eye"} />
             </button>
+            <button
+              type="button"
+              class="icon-btn"
+              title={text.copy}
+              aria-label={text.copy}
+              onclick={() => copyField(draft.password, "password")}
+            >
+              <Icon name="copy" />
+            </button>
+          </div>
+          {#if editing && strengthLabel}
+            <div
+              class="strength"
+              class:weak={strength === "weak"}
+              class:fair={strength === "fair"}
+              class:strong={strength === "strong"}
+            >
+              {strengthLabel}
+            </div>
           {/if}
-          <button
-            type="button"
-            class="icon-btn"
-            title={showPassword ? text.hide : text.show}
-            aria-label={showPassword ? text.hide : text.show}
-            onclick={() => (showPassword = !showPassword)}
-          >
-            <Icon name={showPassword ? "eye-off" : "eye"} />
-          </button>
-          <button
-            type="button"
-            class="icon-btn"
-            title={text.copy}
-            aria-label={text.copy}
-            onclick={() => copyField(draft.password)}
-          >
-            <Icon name="copy" />
-          </button>
         </div>
       </div>
 
@@ -302,7 +330,7 @@
             class="icon-btn"
             title={text.copy}
             aria-label={text.copy}
-            onclick={() => copyField(draft.url)}
+            onclick={() => copyField(draft.url, "url")}
           >
             <Icon name="copy" />
           </button>
@@ -397,6 +425,23 @@
     align-items: start;
   }
 
+  .strength {
+    margin-top: 4px;
+    font-size: 11px;
+  }
+
+  .strength.weak {
+    color: var(--danger);
+  }
+
+  .strength.fair {
+    color: var(--muted);
+  }
+
+  .strength.strong {
+    color: color-mix(in srgb, #16a34a 80%, var(--fg));
+  }
+
   .label {
     padding-top: 8px;
     font-size: 12px;
@@ -406,6 +451,13 @@
 
   .control {
     min-width: 0;
+  }
+
+  .stack {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
   }
 
   .with-action {

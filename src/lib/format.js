@@ -69,3 +69,32 @@ export async function copyText(value) {
     return ok;
   }
 }
+
+/** Best-effort clear; only clears if clipboard still matches `expected`. */
+export async function clearClipboardIfMatches(expected) {
+  const target = String(expected ?? "");
+  if (!target || !navigator.clipboard?.readText) return false;
+  try {
+    const current = await navigator.clipboard.readText();
+    if (current !== target) return false;
+    await navigator.clipboard.writeText("");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Rough entry-password strength: weak | fair | strong */
+export function passwordStrength(value) {
+  const s = String(value ?? "");
+  if (!s) return "";
+  let score = 0;
+  if (s.length >= 8) score += 1;
+  if (s.length >= 12) score += 1;
+  if (/[a-z]/.test(s) && /[A-Z]/.test(s)) score += 1;
+  if (/\d/.test(s)) score += 1;
+  if (/[^A-Za-z0-9]/.test(s)) score += 1;
+  if (score <= 2) return "weak";
+  if (score <= 3) return "fair";
+  return "strong";
+}

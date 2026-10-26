@@ -1,17 +1,17 @@
 {
   "name": "Password Manager",
-  "description": "Organize local passwords in nested groups: create, search, and edit entries.",
+  "description": "Organize local passwords in nested groups. Vault always AES-GCM encrypted; optional Argon2id master password.",
   "icon": "assets/plugin.svg",
   "tags": ["password", "productivity", "workbench"],
   "permissions": [],
   "source": "https://github.com/allran/dbx-plugin-password",
   "homepage": "https://github.com/allran/dbx-plugin-password",
   "license": "Apache-2.0",
-  "releaseNotes": "v0.2.0: nested groups, entry context menu, theme-aware buttons, lock icons, search expands matches, create opens editor.",
+  "releaseNotes": "v0.3.0: vault always encrypted (AES-256-GCM). Open mode uses local vault.key; optional master password (Argon2id). Migrates legacy plaintext vaults.",
   "localizations": {
     "zh-CN": {
       "name": "密码管理",
-      "description": "按多层分组管理本地密码：新建、搜索与编辑条目。"
+      "description": "按多层分组管理本地密码；密码库始终加密，可选主密码解锁。"
     }
   }
 }

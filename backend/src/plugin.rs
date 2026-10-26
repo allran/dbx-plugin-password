@@ -50,10 +50,54 @@ impl PluginHandler for Plugin {
         _emitter: &PluginEmitter,
     ) -> Result<Value, PluginError> {
         match method {
+            "vault/status" => self.with_store(|store| {
+                let (has_password, unlocked) = store.status();
+                Ok(json!({
+                    "hasPassword": has_password,
+                    "unlocked": unlocked,
+                    "locked": has_password && !unlocked,
+                }))
+            }),
+            "vault/unlock" => {
+                let password = field_or_empty(&params, "password");
+                self.with_store(|store| {
+                    store.unlock(password)?;
+                    let (has_password, unlocked) = store.status();
+                    Ok(json!({
+                        "success": true,
+                        "hasPassword": has_password,
+                        "unlocked": unlocked,
+                    }))
+                })
+            }
+            "vault/lock" => self.with_store(|store| {
+                store.lock()?;
+                let (has_password, unlocked) = store.status();
+                Ok(json!({
+                    "success": true,
+                    "hasPassword": has_password,
+                    "unlocked": unlocked,
+                }))
+            }),
+            "vault/setMasterPassword" => {
+                let password = require_str(&params, "password")?;
+                let current = optional_str(&params, "currentPassword");
+                self.with_store(|store| {
+                    store.set_master_password(password, current)?;
+                    Ok(json!({ "success": true, "hasPassword": true, "unlocked": true }))
+                })
+            }
+            "vault/clearMasterPassword" => {
+                let current = require_str(&params, "currentPassword")?;
+                self.with_store(|store| {
+                    store.clear_master_password(current)?;
+                    Ok(json!({ "success": true, "hasPassword": false, "unlocked": true }))
+                })
+            }
             "password/list" => {
                 let query = optional_str(&params, "query");
                 self.with_store(|store| {
-                    let vault = store.list(query);
+                    let vault = store.list(query)?;
                     Ok(json!({
                         "groups": vault.groups,
                         "entries": vault.entries,
@@ -64,7 +108,7 @@ impl PluginHandler for Plugin {
                 let id = require_str(&params, "id")?;
                 self.with_store(|store| {
                     let entry = store
-                        .get_entry(id)
+                        .get_entry(id)?
                         .cloned()
                         .ok_or_else(|| PluginError::new(-32602, "Password entry not found"))?;
                     Ok(json!({ "entry": entry }))

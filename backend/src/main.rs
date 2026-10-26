@@ -1,3 +1,4 @@
+mod crypto;
 mod model;
 mod plugin;
 mod store;

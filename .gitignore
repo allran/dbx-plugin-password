@@ -2,6 +2,7 @@
 /node_modules/
 /.dbx-dev/
 /backend/target/
+/backend/.cargo/
 .dbx-repository-signing-key.env
 .DS_Store
 *.log
