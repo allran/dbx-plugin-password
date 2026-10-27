@@ -24,8 +24,16 @@
 
   function submit() {
     if (unlocking) return;
-    onunlock?.(password);
+    const value = password;
+    password = "";
+    onunlock?.(value);
   }
+
+  $effect(() => {
+    if (error) {
+      queueMicrotask(() => inputEl?.focus());
+    }
+  });
 
   function onKeydown(event) {
     if (event.key === "Enter") {

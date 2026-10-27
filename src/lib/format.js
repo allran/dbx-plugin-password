@@ -70,17 +70,21 @@ export async function copyText(value) {
   }
 }
 
-/** Best-effort clear; only clears if clipboard still matches `expected`. */
+/**
+ * Best-effort clear; only clears if clipboard still matches `expected`.
+ * @returns {"cleared"|"unchanged"|"unsupported"|"denied"}
+ */
 export async function clearClipboardIfMatches(expected) {
   const target = String(expected ?? "");
-  if (!target || !navigator.clipboard?.readText) return false;
+  if (!target) return "unchanged";
+  if (!navigator.clipboard?.readText) return "unsupported";
   try {
     const current = await navigator.clipboard.readText();
-    if (current !== target) return false;
+    if (current !== target) return "unchanged";
     await navigator.clipboard.writeText("");
-    return true;
+    return "cleared";
   } catch {
-    return false;
+    return "denied";
   }
 }
 

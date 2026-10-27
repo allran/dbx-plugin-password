@@ -22,6 +22,8 @@
   let entries = $state([]);
   let query = $state("");
   let selectedId = $state("");
+  /** Full entry from password/get (list omits secrets). */
+  let selectedDetail = $state(null);
   let collapsed = $state({ [DEFAULT_GROUP_ID]: false });
   let bootError = $state("");
   let saving = $state(false);
@@ -29,6 +31,7 @@
   let ready = $state(false);
   let hasPassword = $state(false);
   let unlocked = $state(false);
+  let encryptionPending = $state(false);
   let unlocking = $state(false);
   let unlockError = $state("");
   /** @type {null | "set" | "change" | "clear"} */
@@ -55,7 +58,11 @@
   /** Parent when creating a nested group; empty = root */
   let createParentId = $state("");
 
-  const selected = $derived(entries.find((e) => e.id === selectedId) || null);
+  const selected = $derived(
+    selectedDetail?.id === selectedId
+      ? selectedDetail
+      : entries.find((e) => e.id === selectedId) || null,
+  );
 
   const groupOptions = $derived(flattenGroupOptions(groups, locale, text));
 
@@ -109,9 +116,12 @@
     clipboardPending = String(value ?? "");
     if (!clipboardPending) return;
     clipboardTimer = setTimeout(async () => {
-      const cleared = await clearClipboardIfMatches(clipboardPending);
+      const result = await clearClipboardIfMatches(clipboardPending);
       clipboardPending = "";
-      if (cleared) showToast(text.clipboardCleared);
+      if (result === "cleared") showToast(text.clipboardCleared);
+      else if (result === "denied" || result === "unsupported") {
+        showToast(text.clipboardClearSkipped);
+      }
     }, CLIPBOARD_CLEAR_MS);
   }
 
@@ -138,13 +148,45 @@
       "Master password is required": text.requiredMasterPassword,
       "Current master password is required": text.requiredCurrentMasterPassword,
       "Master password must be at least 8 characters": text.masterPasswordTooShort,
+      "Invalid encrypted vault": text.invalidVault,
+      "Invalid vault payload": text.invalidVault,
+      "Invalid vault encoding": text.invalidVault,
+      "Unsupported vault format": text.invalidVault,
+      "Vault is not encrypted": text.invalidVault,
+      "Vault decryption failed": text.vaultDecryptFailed,
+      "Missing vault open key": text.missingOpenKey,
+      "Invalid vault open key": text.missingOpenKey,
     };
-    return mapped[raw] || raw;
+    if (mapped[raw]) return mapped[raw];
+    if (raw.startsWith("Unsupported vault version")) {
+      return text.unsupportedVaultVersion;
+    }
+    if (raw.startsWith("Unsupported vault")) return text.invalidVault;
+    return raw;
+  }
+
+  async function fetchEntryDetail(id) {
+    if (!id) {
+      selectedDetail = null;
+      return;
+    }
+    try {
+      const result = await window.dbxPlugin.invoke("password/get", { id });
+      selectedDetail = result?.entry || null;
+    } catch {
+      selectedDetail = null;
+    }
+  }
+
+  async function selectEntry(id) {
+    selectedId = id || "";
+    await fetchEntryDetail(selectedId);
   }
 
   function applyVaultStatus(result) {
     hasPassword = Boolean(result?.hasPassword);
     unlocked = Boolean(result?.unlocked);
+    encryptionPending = Boolean(result?.encryptionPending);
   }
 
   async function refreshVaultStatus() {
@@ -154,6 +196,7 @@
   }
 
   async function loadList(keepSelection = true) {
+    await refreshVaultStatus().catch(() => {});
     const result = await window.dbxPlugin.invoke("password/list", {
       query: "",
     });
@@ -170,6 +213,9 @@
 
     if (keepSelection && selectedId && !entries.some((e) => e.id === selectedId)) {
       selectedId = "";
+      selectedDetail = null;
+    } else if (keepSelection && selectedId) {
+      await fetchEntryDetail(selectedId);
     }
   }
 
@@ -203,6 +249,7 @@
       groups = [];
       entries = [];
       selectedId = "";
+      selectedDetail = null;
       query = "";
       unlockError = "";
     } catch (err) {
@@ -291,7 +338,7 @@
   function openEntryMenu(event, entryId) {
     event.preventDefault();
     event.stopPropagation();
-    selectedId = entryId;
+    void selectEntry(entryId);
     menu = {
       kind: "entry",
       x: Math.min(event.clientX, window.innerWidth - 180),
@@ -301,8 +348,10 @@
   }
 
   function requestEditEntry(entryId) {
-    selectedId = entryId;
-    editRequestToken += 1;
+    void (async () => {
+      await selectEntry(entryId);
+      editRequestToken += 1;
+    })();
   }
 
   async function handlePromptConfirm(value) {
@@ -352,9 +401,12 @@
         });
         await loadList();
         const newId = result?.entry?.id || "";
-        selectedId = newId;
+        if (newId) {
+          selectedDetail = result.entry;
+          selectedId = newId;
+          editRequestToken += 1;
+        }
         collapsed = { ...collapsed, [createGroupId]: false };
-        if (newId) editRequestToken += 1;
         showToast(text.created);
       }
       prompt = null;
@@ -376,7 +428,10 @@
       } else if (confirm.kind === "delete-entry") {
         const id = confirm.id;
         await window.dbxPlugin.invoke("password/delete", { id });
-        if (selectedId === id) selectedId = "";
+        if (selectedId === id) {
+          selectedId = "";
+          selectedDetail = null;
+        }
         await loadList();
         showToast(text.deleted);
       }
@@ -406,7 +461,9 @@
         notes: draft.notes,
       });
       await loadList();
-      selectedId = result?.entry?.id || draft.id;
+      const nextId = result?.entry?.id || draft.id;
+      selectedId = nextId;
+      selectedDetail = result?.entry || null;
       showToast(text.saved);
     } catch (err) {
       showToast(errorMessage(err));
@@ -516,6 +573,7 @@
     groups = [];
     entries = [];
     selectedId = "";
+    selectedDetail = null;
     query = "";
     unlockError = "";
   }
@@ -578,6 +636,12 @@
 {:else if !unlocked}
   <div class="boot error">{text.vaultUnavailable}</div>
 {:else}
+<div class="shell">
+  {#if encryptionPending}
+    <div class="encrypt-warn" role="status">
+      {text.encryptionPending}
+    </div>
+  {/if}
 <div class="app">
   <aside class="sidebar">
     <div class="actions">
@@ -635,7 +699,7 @@
             {text}
             onToggle={toggleGroup}
             onGroupMenu={openGroupMenu}
-            onSelectEntry={(id) => (selectedId = id)}
+            onSelectEntry={selectEntry}
             onEntryMenu={openEntryMenu}
           />
         {/each}
@@ -657,6 +721,7 @@
       ongenerated={() => showToast(text.passwordGenerated)}
     />
   </main>
+</div>
 </div>
 
 <Toast message={toastMessage} visible={toastVisible} />
@@ -753,10 +818,27 @@
     height: 100%;
   }
 
+  .shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .encrypt-warn {
+    flex: 0 0 auto;
+    padding: 8px 12px;
+    border-bottom: 1px solid color-mix(in srgb, #ca8a04 35%, var(--border));
+    background: color-mix(in srgb, #ca8a04 14%, var(--bg));
+    color: color-mix(in srgb, #a16207 70%, var(--fg));
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
   .app {
     display: grid;
     grid-template-columns: var(--sidebar-width) 1fr;
-    height: 100%;
+    flex: 1;
     min-height: 0;
   }
 

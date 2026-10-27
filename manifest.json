@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "io.dbx.password",
   "name": "Password Manager",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "alan",
   "description": "Local password manager with nested groups; vault always encrypted, optional master password.",
   "icon": "assets/plugin.svg",

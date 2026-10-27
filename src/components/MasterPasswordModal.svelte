@@ -58,6 +58,12 @@
     });
   });
 
+  function clearSecrets() {
+    currentPassword = "";
+    password = "";
+    confirmPassword = "";
+  }
+
   function submit() {
     if (confirming) return;
     localError = "";
@@ -66,7 +72,9 @@
         localError = text.requiredCurrentMasterPassword;
         return;
       }
-      onconfirm?.({ currentPassword });
+      const current = currentPassword;
+      clearSecrets();
+      onconfirm?.({ currentPassword: current });
       return;
     }
     if (mode === "change" && !currentPassword.trim()) {
@@ -85,10 +93,12 @@
       localError = text.masterPasswordMismatch;
       return;
     }
-    onconfirm?.({
+    const next = {
       password,
       currentPassword: mode === "change" ? currentPassword : undefined,
-    });
+    };
+    clearSecrets();
+    onconfirm?.(next);
   }
 
   function onKeydown(event) {

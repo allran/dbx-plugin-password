@@ -7,7 +7,7 @@
   "source": "https://github.com/allran/dbx-plugin-password",
   "homepage": "https://github.com/allran/dbx-plugin-password",
   "license": "Apache-2.0",
-  "releaseNotes": "v0.3.1: fix vault.key write order (key before envelope), 0600 key permissions, skip rewriting key on every save, lock clears memory even if persist fails, migrate failures no longer silent.",
+  "releaseNotes": "v0.3.2: Windows atomic replace (MoveFileEx), GCM AAD + Argon2 params in envelope (v3), zeroize keys, envelope validation, list redacts passwords (password/get for detail), i18n/clipboard UX.",
   "localizations": {
     "zh-CN": {
       "name": "密码管理",

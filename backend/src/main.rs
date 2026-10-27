@@ -1,4 +1,5 @@
 mod crypto;
+mod fsutil;
 mod model;
 mod plugin;
 mod store;

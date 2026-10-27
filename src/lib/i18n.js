@@ -82,6 +82,12 @@ export const messages = {
       "Removes the unlock prompt. The vault stays encrypted using a local key file (vault.key) next to the database.",
     toggleGroup: "Expand or collapse group",
     clipboardCleared: "Clipboard cleared",
+    clipboardClearSkipped:
+      "Could not clear clipboard automatically (permission denied). Clear it manually if needed.",
+    invalidVault: "Invalid or unsupported vault file",
+    vaultDecryptFailed: "Vault decryption failed",
+    missingOpenKey: "Missing vault open key (vault.key)",
+    unsupportedVaultVersion: "Unsupported vault version",
     passwordStrengthWeak: "Weak password",
     passwordStrengthFair: "Fair password",
     passwordStrengthStrong: "Strong password",
@@ -99,6 +105,8 @@ export const messages = {
     wrongMasterPassword: "Wrong master password",
     vaultUnavailable:
       "The password vault could not be opened. The local vault.key may be missing or the vault file is damaged.",
+    encryptionPending:
+      "Vault is not encrypted on disk yet. Check that the plugin data directory is writable, then save any entry to retry.",
     appTitle: "Password Manager",
   },
   zh: {
@@ -182,6 +190,11 @@ export const messages = {
       "关闭后不再弹出解锁页。密码库仍加密，密钥保存在同目录的 vault.key 中。",
     toggleGroup: "展开或折叠分组",
     clipboardCleared: "已清除剪贴板",
+    clipboardClearSkipped: "无法自动清除剪贴板（无读取权限）。如需可手动清空。",
+    invalidVault: "密码库文件无效或不支持",
+    vaultDecryptFailed: "密码库解密失败",
+    missingOpenKey: "缺少本地密钥文件 vault.key",
+    unsupportedVaultVersion: "不支持的密码库版本",
     passwordStrengthWeak: "密码较弱",
     passwordStrengthFair: "密码一般",
     passwordStrengthStrong: "密码较强",
@@ -199,6 +212,8 @@ export const messages = {
     wrongMasterPassword: "主密码错误",
     vaultUnavailable:
       "无法打开密码库。本地 vault.key 可能丢失，或密码库文件已损坏。",
+    encryptionPending:
+      "密码库尚未写入加密存储。请检查插件数据目录是否可写，然后保存任意条目以重试。",
     appTitle: "密码管理",
   },
 };

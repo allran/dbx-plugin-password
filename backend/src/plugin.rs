@@ -51,32 +51,35 @@ impl PluginHandler for Plugin {
     ) -> Result<Value, PluginError> {
         match method {
             "vault/status" => self.with_store(|store| {
-                let (has_password, unlocked) = store.status();
+                let (has_password, unlocked, encryption_pending) = store.status();
                 Ok(json!({
                     "hasPassword": has_password,
                     "unlocked": unlocked,
                     "locked": has_password && !unlocked,
+                    "encryptionPending": encryption_pending,
                 }))
             }),
             "vault/unlock" => {
                 let password = field_or_empty(&params, "password");
                 self.with_store(|store| {
                     store.unlock(password)?;
-                    let (has_password, unlocked) = store.status();
+                    let (has_password, unlocked, encryption_pending) = store.status();
                     Ok(json!({
                         "success": true,
                         "hasPassword": has_password,
                         "unlocked": unlocked,
+                        "encryptionPending": encryption_pending,
                     }))
                 })
             }
             "vault/lock" => self.with_store(|store| {
                 store.lock()?;
-                let (has_password, unlocked) = store.status();
+                let (has_password, unlocked, encryption_pending) = store.status();
                 Ok(json!({
                     "success": true,
                     "hasPassword": has_password,
                     "unlocked": unlocked,
+                    "encryptionPending": encryption_pending,
                 }))
             }),
             "vault/setMasterPassword" => {
@@ -84,14 +87,26 @@ impl PluginHandler for Plugin {
                 let current = optional_str(&params, "currentPassword");
                 self.with_store(|store| {
                     store.set_master_password(password, current)?;
-                    Ok(json!({ "success": true, "hasPassword": true, "unlocked": true }))
+                    let (_, _, encryption_pending) = store.status();
+                    Ok(json!({
+                        "success": true,
+                        "hasPassword": true,
+                        "unlocked": true,
+                        "encryptionPending": encryption_pending,
+                    }))
                 })
             }
             "vault/clearMasterPassword" => {
                 let current = require_str(&params, "currentPassword")?;
                 self.with_store(|store| {
                     store.clear_master_password(current)?;
-                    Ok(json!({ "success": true, "hasPassword": false, "unlocked": true }))
+                    let (_, _, encryption_pending) = store.status();
+                    Ok(json!({
+                        "success": true,
+                        "hasPassword": false,
+                        "unlocked": true,
+                        "encryptionPending": encryption_pending,
+                    }))
                 })
             }
             "password/list" => {

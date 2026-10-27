@@ -1,14 +1,17 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 
 use dbx_plugin_sdk::PluginError;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
-    b64_decode, b64_encode, decrypt, derive_key, encrypt, random_key, random_salt,
+    b64_decode, b64_encode, decrypt, derive_key, derive_key_default, encrypt, envelope_aad,
+    keys_eq, random_key, random_salt, ARGON2_ITERATIONS, ARGON2_MEMORY_KIB, ARGON2_PARALLELISM,
+    KEY_LEN,
 };
+use crate::fsutil::{chmod_owner_only, ensure_parent, write_private_file};
 use crate::model::{
     EncryptedVaultFile, Group, PasswordEntry, VaultData, DEFAULT_GROUP_ID,
 };
@@ -19,8 +22,15 @@ pub struct VaultStore {
     path: PathBuf,
     unlocked: bool,
     has_password: bool,
-    master_key: Option<[u8; 32]>,
+    /// True when the in-memory vault is usable but the on-disk file is still
+    /// plaintext / missing encrypted envelope (migrate or create write failed).
+    encryption_pending: bool,
+    master_key: Option<Zeroizing<[u8; KEY_LEN]>>,
     salt: Option<Vec<u8>>,
+    /// Argon2 m/t/p from the unlocked envelope (password mode).
+    kdf_memory_kib: u32,
+    kdf_iterations: u32,
+    kdf_parallelism: u32,
 }
 
 impl VaultStore {
@@ -35,86 +45,25 @@ impl VaultStore {
         data
     }
 
-    fn read_open_key(path: &PathBuf) -> Result<[u8; 32], PluginError> {
+    fn read_open_key(path: &PathBuf) -> Result<Zeroizing<[u8; KEY_LEN]>, PluginError> {
         let raw = fs::read_to_string(path)
             .map_err(|_| PluginError::new(-32000, "Missing vault open key"))?;
         let bytes = b64_decode(raw.trim())?;
-        if bytes.len() != 32 {
+        if bytes.len() != KEY_LEN {
             return Err(PluginError::new(-32000, "Invalid vault open key"));
         }
-        let mut key = [0u8; 32];
+        let mut key = [0u8; KEY_LEN];
         key.copy_from_slice(&bytes);
-        Ok(key)
+        Ok(Zeroizing::new(key))
     }
 
-    fn ensure_parent(path: &PathBuf) -> Result<(), PluginError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                PluginError::new(-32000, format!("Failed to create data dir: {err}"))
-            })?;
-        }
-        Ok(())
+    fn write_open_key(path: &PathBuf, key: &[u8; KEY_LEN]) -> Result<(), PluginError> {
+        write_private_file(path, b64_encode(key).as_bytes(), "key.tmp")
     }
 
-    /// Atomically write `vault.key` with mode 0600 from creation (no 0644 window).
-    fn write_open_key(path: &PathBuf, key: &[u8; 32]) -> Result<(), PluginError> {
-        Self::ensure_parent(path)?;
-        let tmp = path.with_extension("key.tmp");
-        let payload = b64_encode(key);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .map_err(|err| {
-                    PluginError::new(-32000, format!("Failed to write vault key: {err}"))
-                })?;
-            file.write_all(payload.as_bytes()).map_err(|err| {
-                let _ = fs::remove_file(&tmp);
-                PluginError::new(-32000, format!("Failed to write vault key: {err}"))
-            })?;
-            file.sync_all().map_err(|err| {
-                let _ = fs::remove_file(&tmp);
-                PluginError::new(-32000, format!("Failed to sync vault key: {err}"))
-            })?;
-        }
-        #[cfg(not(unix))]
-        {
-            fs::write(&tmp, payload.as_bytes()).map_err(|err| {
-                PluginError::new(-32000, format!("Failed to write vault key: {err}"))
-            })?;
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = fs::remove_file(path);
-        }
-        fs::rename(&tmp, path).map_err(|err| {
-            let _ = fs::remove_file(&tmp);
-            PluginError::new(-32000, format!("Failed to replace vault key: {err}"))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-                PluginError::new(
-                    -32000,
-                    format!("Failed to set vault key permissions: {err}"),
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    fn open_key_matches(path: &PathBuf, key: &[u8; 32]) -> bool {
+    fn open_key_matches(path: &PathBuf, key: &[u8; KEY_LEN]) -> bool {
         Self::read_open_key(path)
-            .map(|existing| existing == *key)
+            .map(|existing| keys_eq(&*existing, key))
             .unwrap_or(false)
     }
 
@@ -122,69 +71,95 @@ impl VaultStore {
         let _ = fs::remove_file(path);
     }
 
-    fn chmod_owner_only(path: &PathBuf) -> Result<(), PluginError> {
+    /// Idempotent fix for legacy `vault.key` files created as 0644 (0.3.0).
+    fn ensure_open_key_permissions(path: &PathBuf) -> Result<(), PluginError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-                PluginError::new(-32000, format!("Failed to set vault permissions: {err}"))
+            let meta = fs::metadata(path).map_err(|err| {
+                PluginError::new(-32000, format!("Failed to stat vault key: {err}"))
             })?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                chmod_owner_only(path)?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            chmod_owner_only(path)?;
         }
         let _ = path;
         Ok(())
     }
 
     fn replace_envelope(&self, raw: &str) -> Result<(), PluginError> {
-        let tmp = self.path.with_extension("json.tmp");
+        write_private_file(&self.path, raw.as_bytes(), "json.tmp")
+    }
+
+    fn validate_envelope(envelope: &EncryptedVaultFile) -> Result<(), PluginError> {
+        if envelope.format != EncryptedVaultFile::FORMAT {
+            return Err(PluginError::new(-32602, "Unsupported vault format"));
+        }
+        if !envelope.encrypted {
+            return Err(PluginError::new(-32602, "Vault is not encrypted"));
+        }
+        if envelope.version < EncryptedVaultFile::MIN_SUPPORTED_VERSION
+            || envelope.version > EncryptedVaultFile::VERSION
         {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp)
-                    .map_err(|err| {
-                        PluginError::new(-32000, format!("Failed to write vault: {err}"))
-                    })?;
-                file.write_all(raw.as_bytes()).map_err(|err| {
-                    let _ = fs::remove_file(&tmp);
-                    PluginError::new(-32000, format!("Failed to write vault: {err}"))
-                })?;
-                file.sync_all().map_err(|err| {
-                    let _ = fs::remove_file(&tmp);
-                    PluginError::new(-32000, format!("Failed to sync vault: {err}"))
-                })?;
+            return Err(PluginError::new(
+                -32602,
+                format!("Unsupported vault version: {}", envelope.version),
+            ));
+        }
+        if envelope.protection != EncryptedVaultFile::PROTECTION_OPEN
+            && envelope.protection != EncryptedVaultFile::PROTECTION_PASSWORD
+        {
+            return Err(PluginError::new(
+                -32602,
+                format!("Unsupported vault protection: {}", envelope.protection),
+            ));
+        }
+        if envelope.protection == EncryptedVaultFile::PROTECTION_PASSWORD {
+            if envelope.kdf != EncryptedVaultFile::KDF {
+                return Err(PluginError::new(
+                    -32602,
+                    format!("Unsupported vault KDF: {}", envelope.kdf),
+                ));
             }
-            #[cfg(not(unix))]
-            {
-                fs::write(&tmp, raw.as_bytes()).map_err(|err| {
-                    PluginError::new(-32000, format!("Failed to write vault: {err}"))
-                })?;
+            if envelope.salt.trim().is_empty() {
+                return Err(PluginError::new(-32602, "Missing vault salt"));
             }
         }
-        #[cfg(windows)]
-        {
-            let _ = fs::remove_file(&self.path);
+        if envelope.nonce.trim().is_empty() || envelope.ciphertext.trim().is_empty() {
+            return Err(PluginError::new(-32602, "Invalid encrypted vault"));
         }
-        fs::rename(&tmp, &self.path).map_err(|err| {
-            let _ = fs::remove_file(&tmp);
-            PluginError::new(-32000, format!("Failed to replace vault: {err}"))
-        })?;
-        Self::chmod_owner_only(&self.path)?;
         Ok(())
+    }
+
+    fn envelope_aad_bytes(envelope: &EncryptedVaultFile) -> Vec<u8> {
+        // v2 envelopes were sealed without AAD; v3+ bind metadata.
+        if envelope.version >= 3 {
+            envelope_aad(
+                envelope.version,
+                &envelope.protection,
+                &envelope.kdf,
+                &envelope.salt,
+            )
+        } else {
+            Vec::new()
+        }
     }
 
     fn decrypt_envelope(
         envelope: &EncryptedVaultFile,
-        key: &[u8; 32],
+        key: &[u8; KEY_LEN],
     ) -> Result<VaultData, PluginError> {
+        Self::validate_envelope(envelope)?;
         let nonce = b64_decode(&envelope.nonce)?;
         let ciphertext = b64_decode(&envelope.ciphertext)?;
-        let plaintext = decrypt(key, &nonce, &ciphertext)?;
-        let data: VaultData = serde_json::from_slice(&plaintext)
+        let aad = Self::envelope_aad_bytes(envelope);
+        let plaintext = decrypt(key, &nonce, &ciphertext, &aad)?;
+        let data: VaultData = serde_json::from_slice(plaintext.as_ref())
             .map_err(|_| PluginError::new(-32602, "Invalid vault payload"))?;
         Ok(Self::prepare_data(data))
     }
@@ -194,13 +169,17 @@ impl VaultStore {
     fn bootstrap_open(path: PathBuf, data: VaultData) -> Result<Self, PluginError> {
         let data = Self::prepare_data(data);
         let key = random_key();
-        let store = Self {
+        let mut store = Self {
             data,
             path,
             unlocked: true,
             has_password: false,
+            encryption_pending: true,
             master_key: Some(key),
             salt: None,
+            kdf_memory_kib: ARGON2_MEMORY_KIB,
+            kdf_iterations: ARGON2_ITERATIONS,
+            kdf_parallelism: ARGON2_PARALLELISM,
         };
         store.persist()?;
         Ok(store)
@@ -220,8 +199,12 @@ impl VaultStore {
                     path,
                     unlocked: true,
                     has_password: false,
+                    encryption_pending: true,
                     master_key: Some(random_key()),
                     salt: None,
+                    kdf_memory_kib: ARGON2_MEMORY_KIB,
+                    kdf_iterations: ARGON2_ITERATIONS,
+                    kdf_parallelism: ARGON2_PARALLELISM,
                 }
             }
         }
@@ -233,8 +216,12 @@ impl VaultStore {
             path,
             unlocked: false,
             has_password,
+            encryption_pending: false,
             master_key: None,
             salt,
+            kdf_memory_kib: ARGON2_MEMORY_KIB,
+            kdf_iterations: ARGON2_ITERATIONS,
+            kdf_parallelism: ARGON2_PARALLELISM,
         }
     }
 
@@ -255,13 +242,19 @@ impl VaultStore {
                     let key_path = Self::open_key_path(&path);
                     if let Ok(key) = Self::read_open_key(&key_path) {
                         if let Ok(data) = Self::decrypt_envelope(&envelope, &key) {
+                            // N2: fix legacy 0644 keys from 0.3.0 without rewriting contents.
+                            let _ = Self::ensure_open_key_permissions(&key_path);
                             return Self {
                                 data,
                                 path,
                                 unlocked: true,
                                 has_password: false,
+                                encryption_pending: false,
                                 master_key: Some(key),
                                 salt: None,
+                                kdf_memory_kib: ARGON2_MEMORY_KIB,
+                                kdf_iterations: ARGON2_ITERATIONS,
+                                kdf_parallelism: ARGON2_PARALLELISM,
                             };
                         }
                     }
@@ -358,8 +351,8 @@ impl VaultStore {
         }
     }
 
-    pub fn status(&self) -> (bool, bool) {
-        (self.has_password, self.unlocked)
+    pub fn status(&self) -> (bool, bool, bool) {
+        (self.has_password, self.unlocked, self.encryption_pending)
     }
 
     fn require_unlocked(&self) -> Result<(), PluginError> {
@@ -370,44 +363,63 @@ impl VaultStore {
         }
     }
 
-    fn persist(&self) -> Result<(), PluginError> {
-        Self::ensure_parent(&self.path)?;
+    fn persist(&mut self) -> Result<(), PluginError> {
+        ensure_parent(&self.path)?;
 
         let key = self
             .master_key
             .as_ref()
             .ok_or_else(|| PluginError::new(-32602, "Vault is locked"))?;
-        let plaintext = serde_json::to_vec(&self.data).map_err(|err| {
+        let mut plaintext = serde_json::to_vec(&self.data).map_err(|err| {
             PluginError::new(-32000, format!("Failed to serialize vault: {err}"))
         })?;
-        let (ciphertext, nonce) = encrypt(key, &plaintext)?;
 
-        let envelope = if self.has_password {
-            let salt = self
-                .salt
-                .as_ref()
-                .ok_or_else(|| PluginError::new(-32000, "Missing vault salt"))?;
-            EncryptedVaultFile {
-                format: EncryptedVaultFile::FORMAT.to_string(),
-                version: EncryptedVaultFile::VERSION,
-                encrypted: true,
-                protection: EncryptedVaultFile::PROTECTION_PASSWORD.to_string(),
-                kdf: EncryptedVaultFile::KDF.to_string(),
-                salt: b64_encode(salt),
-                nonce: b64_encode(&nonce),
-                ciphertext: b64_encode(&ciphertext),
-            }
-        } else {
-            EncryptedVaultFile {
-                format: EncryptedVaultFile::FORMAT.to_string(),
-                version: EncryptedVaultFile::VERSION,
-                encrypted: true,
-                protection: EncryptedVaultFile::PROTECTION_OPEN.to_string(),
-                kdf: String::new(),
-                salt: String::new(),
-                nonce: b64_encode(&nonce),
-                ciphertext: b64_encode(&ciphertext),
-            }
+        let (protection, kdf, salt_b64, kdf_memory_kib, kdf_iterations, kdf_parallelism) =
+            if self.has_password {
+                let salt = self
+                    .salt
+                    .as_ref()
+                    .ok_or_else(|| PluginError::new(-32000, "Missing vault salt"))?;
+                (
+                    EncryptedVaultFile::PROTECTION_PASSWORD.to_string(),
+                    EncryptedVaultFile::KDF.to_string(),
+                    b64_encode(salt),
+                    Some(ARGON2_MEMORY_KIB),
+                    Some(ARGON2_ITERATIONS),
+                    Some(ARGON2_PARALLELISM),
+                )
+            } else {
+                (
+                    EncryptedVaultFile::PROTECTION_OPEN.to_string(),
+                    String::new(),
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+        let aad = envelope_aad(
+            EncryptedVaultFile::VERSION,
+            &protection,
+            &kdf,
+            &salt_b64,
+        );
+        let (ciphertext, nonce) = encrypt(&**key, &plaintext, &aad)?;
+        plaintext.zeroize();
+
+        let envelope = EncryptedVaultFile {
+            format: EncryptedVaultFile::FORMAT.to_string(),
+            version: EncryptedVaultFile::VERSION,
+            encrypted: true,
+            protection,
+            kdf,
+            kdf_memory_kib,
+            kdf_iterations,
+            kdf_parallelism,
+            salt: salt_b64,
+            nonce: b64_encode(&nonce),
+            ciphertext: b64_encode(&ciphertext),
         };
 
         let raw = serde_json::to_string_pretty(&envelope).map_err(|err| {
@@ -423,16 +435,57 @@ impl VaultStore {
             // crash cannot leave ciphertext that no key can open. Skip rewrite when the
             // on-disk key already matches (P2: avoid non-atomic rewrite every save).
             let key_path = Self::open_key_path(&self.path);
-            if !Self::open_key_matches(&key_path, key) {
-                Self::write_open_key(&key_path, key)?;
+            let key_existed = key_path.exists();
+            let key_matched = Self::open_key_matches(&key_path, &**key);
+            if !key_matched {
+                Self::write_open_key(&key_path, &**key)?;
+            } else {
+                // N2: content match still fixes legacy 0644 permissions.
+                Self::ensure_open_key_permissions(&key_path)?;
             }
-            self.replace_envelope(&raw)?;
+            if let Err(err) = self.replace_envelope(&raw) {
+                // Drop orphan key created in this attempt when no prior key existed.
+                if !key_matched && !key_existed {
+                    Self::remove_open_key(&key_path);
+                }
+                return Err(err);
+            }
+        }
+        self.encryption_pending = false;
+        Ok(())
+    }
+
+    fn verify_current_password(&self, password: &str) -> Result<(), PluginError> {
+        let salt = self
+            .salt
+            .as_ref()
+            .ok_or_else(|| PluginError::new(-32000, "Missing vault salt"))?;
+        let key = self
+            .master_key
+            .as_ref()
+            .ok_or_else(|| PluginError::new(-32602, "Vault is locked"))?;
+        let check = derive_key(
+            password,
+            salt,
+            self.kdf_memory_kib,
+            self.kdf_iterations,
+            self.kdf_parallelism,
+        )?;
+        if !keys_eq(&*check, &**key) {
+            return Err(PluginError::new(-32602, "Wrong master password"));
         }
         Ok(())
     }
 
     pub fn unlock(&mut self, password: &str) -> Result<(), PluginError> {
         if self.unlocked {
+            if self.has_password {
+                let password = password.trim();
+                if password.is_empty() {
+                    return Err(PluginError::new(-32602, "Master password is required"));
+                }
+                self.verify_current_password(password)?;
+            }
             return Ok(());
         }
         if !self.has_password {
@@ -443,7 +496,14 @@ impl VaultStore {
                 .map_err(|err| PluginError::new(-32000, format!("Failed to read vault: {err}")))?;
             let envelope: EncryptedVaultFile = serde_json::from_str(&raw)
                 .map_err(|_| PluginError::new(-32602, "Invalid encrypted vault"))?;
-            self.data = Self::decrypt_envelope(&envelope, &key)?;
+            self.data = Self::decrypt_envelope(&envelope, &*key).map_err(|err| {
+                let msg = format!("{err:?}");
+                if msg.contains("decrypt") || msg.contains("Decryption") {
+                    PluginError::new(-32602, "Vault decryption failed")
+                } else {
+                    err
+                }
+            })?;
             self.master_key = Some(key);
             self.unlocked = true;
             return Ok(());
@@ -457,13 +517,33 @@ impl VaultStore {
             .map_err(|err| PluginError::new(-32000, format!("Failed to read vault: {err}")))?;
         let envelope: EncryptedVaultFile = serde_json::from_str(&raw)
             .map_err(|_| PluginError::new(-32602, "Invalid encrypted vault"))?;
+        Self::validate_envelope(&envelope)?;
         let salt = b64_decode(&envelope.salt)?;
-        let key = derive_key(password, &salt)?;
-        self.data = Self::decrypt_envelope(&envelope, &key)?;
-        self.master_key = Some(key);
-        self.salt = Some(salt);
-        self.unlocked = true;
-        Ok(())
+        let (m, t, p) = envelope.argon2_params();
+        let key = derive_key(password, &salt, m, t, p)?;
+        match Self::decrypt_envelope(&envelope, &*key) {
+            Ok(data) => {
+                self.data = data;
+                self.master_key = Some(key);
+                self.salt = Some(salt);
+                self.kdf_memory_kib = m;
+                self.kdf_iterations = t;
+                self.kdf_parallelism = p;
+                self.unlocked = true;
+                Ok(())
+            }
+            Err(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("decrypt")
+                    || msg.contains("Decryption")
+                    || msg.contains("Invalid vault payload")
+                {
+                    Err(PluginError::new(-32602, "Wrong master password"))
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     pub fn lock(&mut self) -> Result<(), PluginError> {
@@ -477,7 +557,7 @@ impl VaultStore {
             }
         }
         self.data = VaultData::default();
-        self.master_key = None;
+        self.master_key = None; // Zeroizing drops and zeroes
         self.unlocked = false;
         Ok(())
     }
@@ -507,29 +587,33 @@ impl VaultStore {
                     "Current master password is required",
                 ));
             }
-            let salt = self
-                .salt
-                .as_ref()
-                .ok_or_else(|| PluginError::new(-32000, "Missing vault salt"))?;
-            let check = derive_key(current, salt)?;
-            if Some(check) != self.master_key {
-                return Err(PluginError::new(-32602, "Wrong master password"));
-            }
+            self.verify_current_password(current)?;
         }
 
         let salt = random_salt();
-        let key = derive_key(password, &salt)?;
+        let key = derive_key_default(password, &salt)?;
         let prev_has_password = self.has_password;
-        let prev_key = self.master_key;
+        let prev_key = self.master_key.take();
         let prev_salt = self.salt.clone();
+        let prev_kdf = (
+            self.kdf_memory_kib,
+            self.kdf_iterations,
+            self.kdf_parallelism,
+        );
         self.has_password = true;
         self.master_key = Some(key);
         self.salt = Some(salt.to_vec());
+        self.kdf_memory_kib = ARGON2_MEMORY_KIB;
+        self.kdf_iterations = ARGON2_ITERATIONS;
+        self.kdf_parallelism = ARGON2_PARALLELISM;
         self.unlocked = true;
         if let Err(err) = self.persist() {
             self.has_password = prev_has_password;
             self.master_key = prev_key;
             self.salt = prev_salt;
+            self.kdf_memory_kib = prev_kdf.0;
+            self.kdf_iterations = prev_kdf.1;
+            self.kdf_parallelism = prev_kdf.2;
             return Err(err);
         }
         Ok(())
@@ -547,18 +631,11 @@ impl VaultStore {
                 "Current master password is required",
             ));
         }
-        let salt = self
-            .salt
-            .as_ref()
-            .ok_or_else(|| PluginError::new(-32000, "Missing vault salt"))?;
-        let check = derive_key(current, salt)?;
-        if Some(check) != self.master_key {
-            return Err(PluginError::new(-32602, "Wrong master password"));
-        }
+        self.verify_current_password(current)?;
 
         // Switch back to open mode: new local key file, still encrypted on disk.
         let key = random_key();
-        let prev_key = self.master_key;
+        let prev_key = self.master_key.take();
         let prev_salt = self.salt.clone();
         self.has_password = false;
         self.master_key = Some(key);
@@ -578,22 +655,26 @@ impl VaultStore {
         Ok(self.data.clone())
     }
 
+    /// List/search without secrets; use `get_entry` for the password field.
     pub fn list(&self, query: Option<&str>) -> Result<VaultData, PluginError> {
         let data = self.snapshot()?;
-        let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else {
-            return Ok(data);
+        let filtered = match query.map(str::trim).filter(|q| !q.is_empty()) {
+            None => data,
+            Some(query) => {
+                let needle = query.to_lowercase();
+                let entries: Vec<PasswordEntry> = data
+                    .entries
+                    .iter()
+                    .filter(|entry| entry_matches(entry, &needle))
+                    .cloned()
+                    .collect();
+                VaultData {
+                    groups: data.groups,
+                    entries,
+                }
+            }
         };
-        let needle = query.to_lowercase();
-        let entries: Vec<PasswordEntry> = data
-            .entries
-            .iter()
-            .filter(|entry| entry_matches(entry, &needle))
-            .cloned()
-            .collect();
-        Ok(VaultData {
-            groups: data.groups,
-            entries,
-        })
+        Ok(filtered.redacted())
     }
 
     fn require_group_mut(&mut self, id: &str) -> Result<&mut Group, PluginError> {
@@ -850,11 +931,19 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_vault_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dbx-pw-vault-test-{nanos}"));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "dbx-pw-vault-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1037,6 +1126,128 @@ mod tests {
     }
 
     #[test]
+    fn matching_key_still_fixes_legacy_permissions() {
+        let dir = tmp_vault_dir();
+        let path = dir.join("vault.json");
+        let key_path = dir.join("vault.key");
+
+        let mut store = VaultStore::load(path.clone());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&key_path).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&key_path, perms).unwrap();
+            assert_eq!(
+                fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+
+        store
+            .create_entry(None, "A", "u", "p", "", "")
+            .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encryption_pending_clears_after_successful_persist() {
+        let dir = tmp_vault_dir();
+        let path = dir.join("vault.json");
+        // Simulate migrate failure: plaintext on disk, in-memory open with pending flag.
+        let legacy = VaultData {
+            groups: vec![Group {
+                id: DEFAULT_GROUP_ID.to_string(),
+                name: "Default".into(),
+                parent_id: String::new(),
+                created_at: 1,
+                updated_at: 1,
+            }],
+            entries: vec![],
+        };
+        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        // Make dir read-only so first bootstrap fails.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o555);
+            fs::set_permissions(&dir, perms).unwrap();
+        }
+
+        let mut store = VaultStore::load(path.clone());
+        #[cfg(unix)]
+        {
+            let (_, _, pending) = store.status();
+            assert!(pending, "readonly migrate should set encryptionPending");
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dir, perms).unwrap();
+        }
+
+        store
+            .create_entry(None, "Recovered", "u", "p", "", "")
+            .unwrap();
+        let (_, _, pending) = store.status();
+        assert!(!pending);
+        let raw = fs::read_to_string(&path).unwrap();
+        let envelope: EncryptedVaultFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.protection, EncryptedVaultFile::PROTECTION_OPEN);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_redacts_passwords_get_returns_secret() {
+        let dir = tmp_vault_dir();
+        let path = dir.join("vault.json");
+        let mut store = VaultStore::load(path);
+        store
+            .create_entry(None, "T", "u", "secret-pw", "", "")
+            .unwrap();
+        let listed = store.list(None).unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].password, "");
+        let full = store.get_entry(&listed.entries[0].id).unwrap().unwrap();
+        assert_eq!(full.password, "secret-pw");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn password_mode_roundtrip_v3_with_aad() {
+        let dir = tmp_vault_dir();
+        let path = dir.join("vault.json");
+        let mut store = VaultStore::load(path.clone());
+        store
+            .create_entry(None, "T", "u", "secret-pw", "", "")
+            .unwrap();
+        store.set_master_password("test-pass-ok", None).unwrap();
+        store.lock().unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let envelope: EncryptedVaultFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.version, EncryptedVaultFile::VERSION);
+        assert_eq!(envelope.kdf_memory_kib, Some(ARGON2_MEMORY_KIB));
+        assert!(!raw.contains("secret-pw"));
+
+        let mut store2 = VaultStore::load(path);
+        store2.unlock("test-pass-ok").unwrap();
+        assert_eq!(store2.get_entry(&store2.list(None).unwrap().entries[0].id).unwrap().unwrap().password, "secret-pw");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clear_master_password_writes_key_before_envelope() {
         let dir = tmp_vault_dir();
         let path = dir.join("vault.json");
@@ -1054,7 +1265,10 @@ mod tests {
         let err = store.clear_master_password("test-pass").unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("vault key") || msg.contains("Is a directory") || msg.contains("directory"),
+            msg.contains("vault.key")
+                || msg.contains("vault key")
+                || msg.contains("Is a directory")
+                || msg.contains("directory"),
             "unexpected error: {msg}"
         );
         // Envelope must remain password-protected — not replaced with an open envelope.
