@@ -103,6 +103,8 @@ export const messages = {
     masterPasswordCleared: "Master password removed",
     vaultLocked: "Vault is locked",
     wrongMasterPassword: "Wrong master password",
+    wrongMasterPasswordOrCorrupt:
+      "Wrong master password, or the vault file is damaged",
     vaultUnavailable:
       "The password vault could not be opened. The local vault.key may be missing or the vault file is damaged.",
     encryptionPending:
@@ -210,6 +212,7 @@ export const messages = {
     masterPasswordCleared: "已关闭主密码",
     vaultLocked: "密码库已锁定",
     wrongMasterPassword: "主密码错误",
+    wrongMasterPasswordOrCorrupt: "主密码错误，或密码库文件已损坏",
     vaultUnavailable:
       "无法打开密码库。本地 vault.key 可能丢失，或密码库文件已损坏。",
     encryptionPending:

@@ -145,6 +145,7 @@
       "Password entry not found": text.entryNotFound,
       "Vault is locked": text.vaultLocked,
       "Wrong master password": text.wrongMasterPassword,
+      "Wrong master password or vault is corrupted": text.wrongMasterPasswordOrCorrupt,
       "Master password is required": text.requiredMasterPassword,
       "Current master password is required": text.requiredCurrentMasterPassword,
       "Master password must be at least 8 characters": text.masterPasswordTooShort,

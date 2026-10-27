@@ -78,8 +78,13 @@ pub fn chmod_owner_only(path: &Path) -> Result<(), PluginError> {
     }
     #[cfg(windows)]
     {
-        // Best-effort owner-only ACL via icacls (no extra native ACL deps).
-        let _ = restrict_current_user_acl(path);
+        // Best-effort owner-only ACL via System32\icacls.exe (documented sidecar side effect).
+        if let Err(err) = restrict_current_user_acl(path) {
+            eprintln!(
+                "[io.dbx.password] best-effort ACL tighten failed for {}: {err}",
+                path.display()
+            );
+        }
     }
     let _ = path;
     Ok(())
@@ -141,8 +146,14 @@ pub fn write_private_file(dest: &Path, payload: &[u8], tmp_ext: &str) -> Result<
 #[cfg(windows)]
 fn restrict_current_user_acl(path: &Path) -> std::io::Result<()> {
     let path_str = path.to_string_lossy();
-    // Remove inheritance, then grant current user (F). SYSTEM kept for service scenarios.
-    let disable = std::process::Command::new("icacls")
+    let icacls = {
+        let root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        PathBuf::from(root).join("System32").join("icacls.exe")
+    };
+    // Remove inheritance, then grant current user (F).
+    let disable = std::process::Command::new(&icacls)
         .args([&*path_str, "/inheritance:r"])
         .output()?;
     if !disable.status.success() {
@@ -153,7 +164,7 @@ fn restrict_current_user_acl(path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let grant = format!("{user}:(F)");
-    let _ = std::process::Command::new("icacls")
+    let _ = std::process::Command::new(&icacls)
         .args([&*path_str, "/grant:r", &grant])
         .output()?;
     Ok(())

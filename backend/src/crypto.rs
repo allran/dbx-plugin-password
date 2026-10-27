@@ -16,11 +16,46 @@ pub const ARGON2_MEMORY_KIB: u32 = 19_456;
 pub const ARGON2_ITERATIONS: u32 = 2;
 pub const ARGON2_PARALLELISM: u32 = 1;
 
+/// Bounds for envelope/KDF params (reject tampered values that would OOM).
+pub const ARGON2_MEMORY_KIB_MIN: u32 = 8_192;
+pub const ARGON2_MEMORY_KIB_MAX: u32 = 262_144; // 256 MiB
+pub const ARGON2_ITERATIONS_MIN: u32 = 1;
+pub const ARGON2_ITERATIONS_MAX: u32 = 10;
+pub const ARGON2_PARALLELISM_MIN: u32 = 1;
+pub const ARGON2_PARALLELISM_MAX: u32 = 4;
+
+pub fn validate_argon2_params(
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> Result<(), PluginError> {
+    if !(ARGON2_MEMORY_KIB_MIN..=ARGON2_MEMORY_KIB_MAX).contains(&memory_kib) {
+        return Err(PluginError::new(
+            -32602,
+            format!("Unsupported Argon2 memory cost: {memory_kib}"),
+        ));
+    }
+    if !(ARGON2_ITERATIONS_MIN..=ARGON2_ITERATIONS_MAX).contains(&iterations) {
+        return Err(PluginError::new(
+            -32602,
+            format!("Unsupported Argon2 iterations: {iterations}"),
+        ));
+    }
+    if !(ARGON2_PARALLELISM_MIN..=ARGON2_PARALLELISM_MAX).contains(&parallelism) {
+        return Err(PluginError::new(
+            -32602,
+            format!("Unsupported Argon2 parallelism: {parallelism}"),
+        ));
+    }
+    Ok(())
+}
+
 fn argon2_with(
     memory_kib: u32,
     iterations: u32,
     parallelism: u32,
 ) -> Result<Argon2<'static>, PluginError> {
+    validate_argon2_params(memory_kib, iterations, parallelism)?;
     let params = Params::new(memory_kib, iterations, parallelism, Some(KEY_LEN))
         .map_err(|err| PluginError::new(-32000, format!("Invalid Argon2 params: {err}")))?;
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
@@ -86,9 +121,26 @@ pub fn keys_eq(a: &[u8; KEY_LEN], b: &[u8; KEY_LEN]) -> bool {
     diff == 0
 }
 
-/// Canonical AAD binding envelope metadata to the ciphertext (v3+).
-pub fn envelope_aad(version: u32, protection: &str, kdf: &str, salt_b64: &str) -> Vec<u8> {
-    format!("dbx-password-vault|{version}|{protection}|{kdf}|{salt_b64}").into_bytes()
+/// Canonical AAD binding envelope metadata to the ciphertext.
+///
+/// - v3: `format|version|protection|kdf|salt`
+/// - v4+: same, plus `|m|t|p` when password-protected (binds stored KDF costs)
+pub fn envelope_aad(
+    version: u32,
+    protection: &str,
+    kdf: &str,
+    salt_b64: &str,
+    kdf_params: Option<(u32, u32, u32)>,
+) -> Vec<u8> {
+    match kdf_params {
+        Some((m, t, p)) => {
+            format!("dbx-password-vault|{version}|{protection}|{kdf}|{salt_b64}|{m}|{t}|{p}")
+                .into_bytes()
+        }
+        None => {
+            format!("dbx-password-vault|{version}|{protection}|{kdf}|{salt_b64}").into_bytes()
+        }
+    }
 }
 
 pub fn encrypt(

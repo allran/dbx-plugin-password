@@ -8,8 +8,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     b64_decode, b64_encode, decrypt, derive_key, derive_key_default, encrypt, envelope_aad,
-    keys_eq, random_key, random_salt, ARGON2_ITERATIONS, ARGON2_MEMORY_KIB, ARGON2_PARALLELISM,
-    KEY_LEN,
+    keys_eq, random_key, random_salt, validate_argon2_params, ARGON2_ITERATIONS,
+    ARGON2_MEMORY_KIB, ARGON2_PARALLELISM, KEY_LEN,
 };
 use crate::fsutil::{chmod_owner_only, ensure_parent, write_private_file};
 use crate::model::{
@@ -129,6 +129,8 @@ impl VaultStore {
             if envelope.salt.trim().is_empty() {
                 return Err(PluginError::new(-32602, "Missing vault salt"));
             }
+            let (m, t, p) = envelope.argon2_params();
+            validate_argon2_params(m, t, p)?;
         }
         if envelope.nonce.trim().is_empty() || envelope.ciphertext.trim().is_empty() {
             return Err(PluginError::new(-32602, "Invalid encrypted vault"));
@@ -137,13 +139,27 @@ impl VaultStore {
     }
 
     fn envelope_aad_bytes(envelope: &EncryptedVaultFile) -> Vec<u8> {
-        // v2 envelopes were sealed without AAD; v3+ bind metadata.
-        if envelope.version >= 3 {
+        // v2: no AAD. v3: metadata AAD. v4+: also bind Argon2 m/t/p in password mode.
+        if envelope.version >= 4 {
+            let params = if envelope.protection == EncryptedVaultFile::PROTECTION_PASSWORD {
+                Some(envelope.argon2_params())
+            } else {
+                None
+            };
             envelope_aad(
                 envelope.version,
                 &envelope.protection,
                 &envelope.kdf,
                 &envelope.salt,
+                params,
+            )
+        } else if envelope.version >= 3 {
+            envelope_aad(
+                envelope.version,
+                &envelope.protection,
+                &envelope.kdf,
+                &envelope.salt,
+                None,
             )
         } else {
             Vec::new()
@@ -380,13 +396,19 @@ impl VaultStore {
                     .salt
                     .as_ref()
                     .ok_or_else(|| PluginError::new(-32000, "Missing vault salt"))?;
+                validate_argon2_params(
+                    self.kdf_memory_kib,
+                    self.kdf_iterations,
+                    self.kdf_parallelism,
+                )?;
+                // Keep the unlocked KDF costs — never rewrite to build-time defaults.
                 (
                     EncryptedVaultFile::PROTECTION_PASSWORD.to_string(),
                     EncryptedVaultFile::KDF.to_string(),
                     b64_encode(salt),
-                    Some(ARGON2_MEMORY_KIB),
-                    Some(ARGON2_ITERATIONS),
-                    Some(ARGON2_PARALLELISM),
+                    Some(self.kdf_memory_kib),
+                    Some(self.kdf_iterations),
+                    Some(self.kdf_parallelism),
                 )
             } else {
                 (
@@ -399,11 +421,21 @@ impl VaultStore {
                 )
             };
 
+        let aad_params = if self.has_password {
+            Some((
+                self.kdf_memory_kib,
+                self.kdf_iterations,
+                self.kdf_parallelism,
+            ))
+        } else {
+            None
+        };
         let aad = envelope_aad(
             EncryptedVaultFile::VERSION,
             &protection,
             &kdf,
             &salt_b64,
+            aad_params,
         );
         let (ciphertext, nonce) = encrypt(&**key, &plaintext, &aad)?;
         plaintext.zeroize();
@@ -538,7 +570,12 @@ impl VaultStore {
                     || msg.contains("Decryption")
                     || msg.contains("Invalid vault payload")
                 {
-                    Err(PluginError::new(-32602, "Wrong master password"))
+                    // Wrong password and ciphertext/AAD tampering are indistinguishable
+                    // without a separate verifier; keep the message honest.
+                    Err(PluginError::new(
+                        -32602,
+                        "Wrong master password or vault is corrupted",
+                    ))
                 } else {
                     Err(err)
                 }
@@ -555,6 +592,9 @@ impl VaultStore {
             if let Err(err) = self.persist() {
                 eprintln!("[io.dbx.password] persist before lock failed: {err:?}");
             }
+        }
+        for entry in &mut self.data.entries {
+            entry.password.zeroize();
         }
         self.data = VaultData::default();
         self.master_key = None; // Zeroizing drops and zeroes
@@ -1225,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn password_mode_roundtrip_v3_with_aad() {
+    fn password_mode_roundtrip_v4_with_aad() {
         let dir = tmp_vault_dir();
         let path = dir.join("vault.json");
         let mut store = VaultStore::load(path.clone());
@@ -1244,6 +1284,106 @@ mod tests {
         let mut store2 = VaultStore::load(path);
         store2.unlock("test-pass-ok").unwrap();
         assert_eq!(store2.get_entry(&store2.list(None).unwrap().entries[0].id).unwrap().unwrap().password, "secret-pw");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_keeps_unlocked_kdf_params() {
+        use crate::crypto::{encrypt, envelope_aad, random_salt};
+
+        let dir = tmp_vault_dir();
+        let path = dir.join("vault.json");
+        let password = "test-pass-ok";
+        let custom_m = 65_536u32;
+        let custom_t = 3u32;
+        let custom_p = 1u32;
+        let salt = random_salt();
+        let key = derive_key(password, &salt, custom_m, custom_t, custom_p).unwrap();
+        let salt_b64 = b64_encode(&salt);
+        let data = VaultData {
+            groups: vec![Group {
+                id: DEFAULT_GROUP_ID.to_string(),
+                name: "Default".into(),
+                parent_id: String::new(),
+                created_at: 1,
+                updated_at: 1,
+            }],
+            entries: vec![PasswordEntry {
+                id: "e1".into(),
+                group_id: DEFAULT_GROUP_ID.to_string(),
+                title: "T".into(),
+                username: "u".into(),
+                password: "secret-pw".into(),
+                url: String::new(),
+                notes: String::new(),
+                created_at: 1,
+                updated_at: 1,
+            }],
+        };
+        let plaintext = serde_json::to_vec(&data).unwrap();
+        let aad = envelope_aad(
+            4,
+            EncryptedVaultFile::PROTECTION_PASSWORD,
+            EncryptedVaultFile::KDF,
+            &salt_b64,
+            Some((custom_m, custom_t, custom_p)),
+        );
+        let (ciphertext, nonce) = encrypt(&*key, &plaintext, &aad).unwrap();
+        let envelope = EncryptedVaultFile {
+            format: EncryptedVaultFile::FORMAT.to_string(),
+            version: 4,
+            encrypted: true,
+            protection: EncryptedVaultFile::PROTECTION_PASSWORD.to_string(),
+            kdf: EncryptedVaultFile::KDF.to_string(),
+            kdf_memory_kib: Some(custom_m),
+            kdf_iterations: Some(custom_t),
+            kdf_parallelism: Some(custom_p),
+            salt: salt_b64,
+            nonce: b64_encode(&nonce),
+            ciphertext: b64_encode(&ciphertext),
+        };
+        fs::write(&path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+
+        let mut store = VaultStore::load(path.clone());
+        store.unlock(password).unwrap();
+        assert_eq!(store.kdf_memory_kib, custom_m);
+        assert_eq!(store.kdf_iterations, custom_t);
+        store
+            .create_entry(None, "Another", "u", "p2", "", "")
+            .unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let after: EncryptedVaultFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(after.kdf_memory_kib, Some(custom_m));
+        assert_eq!(after.kdf_iterations, Some(custom_t));
+        assert_eq!(after.kdf_parallelism, Some(custom_p));
+
+        let mut store2 = VaultStore::load(path);
+        store2.unlock(password).unwrap();
+        assert_eq!(store2.list(None).unwrap().entries.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_extreme_argon2_memory() {
+        let dir = tmp_vault_dir();
+        let path = dir.join("vault.json");
+        let mut store = VaultStore::load(path.clone());
+        store.set_master_password("test-pass-ok", None).unwrap();
+        store.lock().unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut envelope: EncryptedVaultFile = serde_json::from_str(&raw).unwrap();
+        envelope.kdf_memory_kib = Some(u32::MAX);
+        fs::write(&path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+
+        let mut store2 = VaultStore::load(path);
+        let err = store2.unlock("test-pass-ok").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Unsupported Argon2 memory") || msg.contains("memory"),
+            "unexpected: {msg}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

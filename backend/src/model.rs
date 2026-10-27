@@ -45,6 +45,7 @@ pub struct VaultData {
 /// Version history:
 /// - 2: AES-GCM without AAD; kdf name only
 /// - 3: AES-GCM with AAD over metadata; Argon2 m/t/p stored for password mode
+/// - 4: AAD also binds Argon2 m/t/p; persist keeps unlocked KDF params
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncryptedVaultFile {
@@ -76,8 +77,8 @@ fn default_protection_password() -> String {
 
 impl EncryptedVaultFile {
     pub const FORMAT: &'static str = "dbx-password-vault";
-    /// Current write version (AAD + KDF params).
-    pub const VERSION: u32 = 3;
+    /// Current write version (AAD binds KDF params; persist preserves them).
+    pub const VERSION: u32 = 4;
     pub const MIN_SUPPORTED_VERSION: u32 = 2;
     pub const KDF: &'static str = "argon2id";
     pub const PROTECTION_OPEN: &'static str = "open";

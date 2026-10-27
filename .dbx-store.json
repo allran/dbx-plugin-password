@@ -7,7 +7,7 @@
   "source": "https://github.com/allran/dbx-plugin-password",
   "homepage": "https://github.com/allran/dbx-plugin-password",
   "license": "Apache-2.0",
-  "releaseNotes": "v0.3.2: Windows atomic replace (MoveFileEx), GCM AAD + Argon2 params in envelope (v3), zeroize keys, envelope validation, list redacts passwords (password/get for detail), i18n/clipboard UX.",
+  "releaseNotes": "v0.3.3: persist keeps unlocked Argon2 params (fixes silent rekey on save), AAD v4 binds m/t/p, KDF param bounds, Windows icacls via System32 absolute path.",
   "localizations": {
     "zh-CN": {
       "name": "密码管理",
